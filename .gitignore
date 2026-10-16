@@ -6,3 +6,4 @@ akun_gmail.txt
 *.png
 .env
 .venv/
+telegram_token.txt
