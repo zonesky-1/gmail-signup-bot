@@ -1,210 +1,179 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-⚡ Gmail Signup Telegram Bot (Patchright Engine)
-================================================
-Bot Telegram untuk otomasi pendaftaran akun Gmail berbasis Patchright.
-Semua alur (pengisian form, bypass, input OTP, notifikasi hasil) dikendalikan
-langsung via antarmuka chat Telegram.
-
-Owner-Only: Khusus akun Telegram Owner (USER_ID: 7998819216).
+gmail_telegram_bot.py — Bot Telegram Otomatisasi Pendaftaran Akun Gmail via Patchright.
+Owner-only (7998819216).
+Mendukung:
+  - Step-by-step wizard (/daftar)
+  - Random profile quick signup (/acak)
+  - Satu baris komando (/quick)
+  - Real-time in-place status edit
+  - Prompt OTP interaktif di chat Telegram
+  - Capture screenshot & upload otomatis ke chat
+  - Simpan riwayat ke akun_gmail.txt
 """
-
-import json
 import os
-import random
-import re
-import string
-import subprocess
 import sys
-import threading
 import time
-import urllib.parse
-import urllib.request
+import json
+import random
+import string
+import re
+import threading
+import subprocess
 from datetime import datetime
-from pathlib import Path
+import urllib.request
+import urllib.parse
+import requests
 
-BASE_DIR = Path(__file__).resolve().parent
-TOKEN_FILE = BASE_DIR / "telegram_token.txt"
-OUT_FILE = BASE_DIR / "akun_gmail.txt"
-SCREENSHOT_PATH = BASE_DIR / "debug_gmail_bot.png"
+from patchright.sync_api import sync_playwright
 
-# Load Telegram Bot Token
-DEFAULT_TOKEN = "8934049361:AAEG134iXICEZNFgprYJjCfT_oRAwFNMo9c"
-if TOKEN_FILE.exists():
-    BOT_TOKEN = TOKEN_FILE.read_text(encoding="utf-8").strip() or DEFAULT_TOKEN
-else:
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", DEFAULT_TOKEN)
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOKEN_FILE = os.path.join(HERE, "farmaoalah_token.txt")
+TOKEN = open(TOKEN_FILE).read().strip() if os.path.exists(TOKEN_FILE) else "8934049361:AAEG134iXICEZNFgprYJjCfT_oRAwFNMo9c"
+OWNER = 7998819216
 
-OWNER_ID = 7998819216
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+OUT_FILE = os.path.join(HERE, "akun_gmail.txt")
+SCREENSHOT_FILE = os.path.join(HERE, "debug_gmail_bot.png")
 
-# Default Virtual Display untuk Headless Server Linux (Xvfb :99)
-if sys.platform.startswith("linux") and "DISPLAY" not in os.environ:
-    os.environ["DISPLAY"] = ":99"
+API = f"https://api.telegram.org/bot{TOKEN}/"
+_last_offset = 0
 
-# ── Telegram API Helpers ─────────────────────────────────────────────
+# Random generator data
+NAMA_DEPAN = [
+    "Aditya", "Bayu", "Budi", "Dimas", "Eko", "Fajar", "Gilang", "Hendra",
+    "Indra", "Joko", "Kevin", "Lukman", "Maulana", "Naufal", "Pratama",
+    "Rian", "Rizky", "Satria", "Tegar", "Wahyu", "Yusuf", "Annisa",
+    "Citra", "Dewi", "Fitri", "Indah", "Lestari", "Mega", "Nadia", "Putri",
+    "Rina", "Sari", "Tiara", "Wulan"
+]
+NAMA_BELAKANG = [
+    "Kusuma", "Pratama", "Saputra", "Wijaya", "Santoso", "Hidayat",
+    "Nugroho", "Utomo", "Setiawan", "Wibowo", "Ramadhan", "Permana",
+    "Firmansyah", "Kurniawan", "Gunawan"
+]
 
-def telegram_api(method: str, data: dict | None = None, timeout: int = 35) -> dict:
-    url = API_URL + method
+# State session
+SESSION = {
+    "state": "IDLE",
+    "form": {},
+    "otp_event": threading.Event(),
+    "otp_code": None,
+    "status_mid": None,
+    "cancel_requested": False,
+    "browser": None
+}
+
+def ensure_xvfb():
+    try:
+        r = subprocess.run("DISPLAY=:99 xdpyinfo >/dev/null 2>&1", shell=True, timeout=3)
+        if r.returncode != 0:
+            subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1366x768x24"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.5)
+    except Exception:
+        pass
+    return True
+
+def api(method, data=None, timeout=35):
+    url = API + method
     body = None
     if data is not None:
-        body = urllib.parse.urlencode(data).encode("utf-8")
+        body = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=body)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+def send(chat, text, kb=None, edit_mid=None, parse_mode="Markdown"):
+    payload = {"chat_id": chat, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if edit_mid:
+        payload["message_id"] = edit_mid
+        method = "editMessageText"
+    else:
+        method = "sendMessage"
+    if kb:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": kb})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return api(method, payload)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err_str = str(e).lower()
+        if "not modified" in err_str:
+            return {"ok": True}
+        if "parse" in err_str:
+            payload.pop("parse_mode", None)
+            try:
+                return api(method, payload)
+            except Exception:
+                pass
+        if edit_mid:
+            payload.pop("message_id", None)
+            try:
+                return api("sendMessage", payload)
+            except Exception:
+                pass
+        return {"ok": False, "err": str(e)}
 
-
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = "Markdown") -> dict:
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    res = telegram_api("sendMessage", payload)
-    if not res.get("ok") and parse_mode:
-        payload.pop("parse_mode", None)
-        res = telegram_api("sendMessage", payload)
-    return res
-
-
-def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = "Markdown") -> dict:
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    res = telegram_api("editMessageText", payload)
-    if not res.get("ok") and "message is not modified" in str(res.get("error", "")).lower():
-        return {"ok": True}
-    if not res.get("ok") and parse_mode:
-        payload.pop("parse_mode", None)
-        res = telegram_api("editMessageText", payload)
-    return res
-
-
-def send_photo(chat_id: int, photo_path: Path, caption: str = "") -> bool:
-    if not photo_path.exists():
-        return False
-    cmd = [
-        "curl", "-s",
-        "-F", f"chat_id={chat_id}",
-        "-F", f"photo=@{photo_path.resolve()}",
-    ]
+def send_photo(chat, photo_path, caption=None):
+    if not os.path.exists(photo_path):
+        return {"ok": False, "err": "File not found"}
+    url = API + "sendPhoto"
+    data = {"chat_id": chat}
     if caption:
-        cmd.extend(["-F", f"caption={caption}"])
-    cmd.append(f"{API_URL}sendPhoto")
+        data["caption"] = caption
+        data["parse_mode"] = "Markdown"
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return '"ok":true' in r.stdout.lower()
-    except Exception:
-        return False
+        with open(photo_path, "rb") as f:
+            res = requests.post(url, data=data, files={"photo": f}, timeout=30).json()
+            if not res.get("ok") and "parse" in str(res.get("description", "")).lower():
+                data.pop("parse_mode", None)
+                f.seek(0)
+                return requests.post(url, data=data, files={"photo": f}, timeout=30).json()
+            return res
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
 
-
-def answer_callback(callback_query_id: str, text: str | None = None):
-    payload: dict[str, str] = {"callback_query_id": callback_query_id}
+def answer_cb(cb_id, text=None):
+    payload = {"callback_query_id": cb_id}
     if text:
         payload["text"] = text
-    telegram_api("answerCallbackQuery", payload)
+    try:
+        api("answerCallbackQuery", payload)
+    except Exception:
+        pass
 
+def kb_main():
+    return [
+        [{"text": "📝 Wizard Daftar", "callback_data": "btn_wizard"},
+         {"text": "🎲 Daftar Cepat (Acak)", "callback_data": "btn_quick_rnd"}],
+        [{"text": "📋 Daftar Akun Tersimpan", "callback_data": "btn_accounts"},
+         {"text": "🖥️ Cek Display :99", "callback_data": "btn_display"}],
+        [{"text": "❓ Bantuan / Format", "callback_data": "btn_help"}]
+    ]
 
-def main_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "⚡ Auto Daftar (Cukup No. HP)", "callback_data": "btn_auto"},
-             {"text": "📝 Daftar Manual", "callback_data": "btn_manual"}],
-            [{"text": "📋 Daftar Akun Tersimpan", "callback_data": "btn_list"},
-             {"text": "ℹ️ Info Server & Status", "callback_data": "btn_status"}],
-            [{"text": "🛑 Batalkan Sesi", "callback_data": "btn_cancel"}]
-        ]
-    }
+def kb_gender():
+    return [
+        [{"text": "👨 Pria (Male)", "callback_data": "gen_male"},
+         {"text": "👩 Wanita (Female)", "callback_data": "gen_female"}],
+        [{"text": "🤐 Rahasia (Rather not say)", "callback_data": "gen_none"}],
+        [{"text": "❌ Batal", "callback_data": "btn_cancel"}]
+    ]
 
+def sleep_r(a=0.6, b=1.8):
+    time.sleep(random.uniform(a, b))
 
-# ── Generator Identitas Acak (Realistis Indonesia) ───────────────────
+def human_type(page, el, text):
+    try:
+        el.click()
+        sleep_r(0.2, 0.4)
+        for ch in text:
+            page.keyboard.type(ch)
+            time.sleep(random.uniform(0.04, 0.16))
+        sleep_r()
+    except Exception:
+        page.keyboard.type(text)
 
-FIRST_NAMES = [
-    "Aditya", "Bagas", "Bima", "Dimas", "Fajar", "Galih", "Hendra", "Ilham",
-    "Kurnia", "Mahesa", "Naufal", "Pratama", "Raditya", "Satria", "Wahyu",
-    "Yoga", "Annisa", "Cantika", "Dewi", "Eka", "Fitri", "Gita", "Indah",
-    "Lestari", "Maya", "Nadia", "Putri", "Rani", "Sari", "Tiara", "Wulandari"
-]
-
-LAST_NAMES = [
-    "Santoso", "Saputra", "Wijaya", "Kusuma", "Nugroho", "Hidayat", "Wibowo",
-    "Setiawan", "Utomo", "Permana", "Firmansyah", "Ramadhan", "Gunawan", "Susanto"
-]
-
-def generate_random_identity(phone: str) -> dict:
-    first = random.choice(FIRST_NAMES)
-    last = random.choice(LAST_NAMES)
-    suffix = "".join(random.choices(string.digits, k=3)) + random.choice(string.ascii_lowercase)
-    username = f"{first.lower()}{last.lower()}{suffix}"
-    
-    # Password kuat: Huruf kapital, huruf kecil, angka, simbol
-    pwd_stem = f"{first.capitalize()}{random.randint(100, 999)}"
-    password = f"{pwd_stem}!#x"
-    
-    day = str(random.randint(1, 28))
-    month = str(random.randint(1, 12))
-    year = str(random.randint(1996, 2004))
-    gender = random.choice(["male", "female"])
-    
-    return {
-        "first": first,
-        "last": last,
-        "username": username,
-        "password": password,
-        "phone": phone,
-        "day": day,
-        "month": month,
-        "year": year,
-        "gender": gender
-    }
-
-
-# ── Active Session Manager ───────────────────────────────────────────
-
-class SignupSession:
-    def __init__(self, chat_id: int, account_data: dict, proxy: str | None = None):
-        self.chat_id = chat_id
-        self.data = account_data
-        self.proxy = proxy
-        self.status_msg_id = None
-        self.otp_event = threading.Event()
-        self.otp_code = None
-        self.is_cancelled = False
-        self.browser = None
-        self.context = None
-        self.page = None
-
-
-CURRENT_SESSION: SignupSession | None = None
-SESSION_LOCK = threading.Lock()
-USER_STATE = {}  # chat_id -> state dict
-
-
-def save_account_result(email: str, password: str, phone: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{email}|{password}|{phone}|{ts}\n"
-    with open(OUT_FILE, "a", encoding="utf-8") as f:
-        f.write(line)
-
-
-# ── Browser Automation (Patchright Engine) ───────────────────────────
-
-def human_type(page, el, text: str):
-    el.click()
-    time.sleep(random.uniform(0.15, 0.35))
-    for ch in text:
-        page.keyboard.type(ch)
-        time.sleep(random.uniform(0.04, 0.18))
-    time.sleep(random.uniform(0.3, 0.6))
-
-
-def first_visible(page, selectors: list[str], timeout: int = 2500):
+def first_visible(page, selectors, timeout=2500):
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -214,579 +183,590 @@ def first_visible(page, selectors: list[str], timeout: int = 2500):
             continue
     return None
 
-
-def click_any(page, selectors: tuple = (), texts: tuple = ()) -> bool:
-    loc = first_visible(page, list(selectors), timeout=1500)
+def click_any(page, selectors=(), texts=()):
+    loc = first_visible(page, selectors, timeout=1500)
     if loc:
         loc.click()
-        time.sleep(random.uniform(0.5, 1.2))
+        sleep_r()
         return True
     for t in texts:
-        for sel in (
-            f"button:has-text('{t}')",
-            f"[role=button]:has-text('{t}')",
-            f"div[role=button]:has-text('{t}')",
-            f"a:has-text('{t}')",
-        ):
+        for sel in (f"button:has-text('{t}')", f"[role=button]:has-text('{t}')",
+                    f"div[role=button]:has-text('{t}')", f"a:has-text('{t}')"):
             try:
                 loc = page.locator(sel).first
                 if loc.is_visible(timeout=1200):
                     loc.click()
-                    time.sleep(random.uniform(0.5, 1.2))
+                    sleep_r()
                     return True
             except Exception:
                 continue
     return False
 
-
-def check_google_blocks(page):
+def check_google_blocked(page):
     try:
         body = page.inner_text("body")[:3000].lower()
     except Exception:
-        return
-    for pat in (
-        "browser or app may not be secure",
-        "unusual traffic",
-        "couldn't create your account",
-        "browser atau aplikasi mungkin tidak aman",
-        "lalu lintas yang tidak biasa",
-        "tidak dapat membuat akun",
-        "this page isn't available",
-    ):
+        return None
+    for pat in ("browser or app may not be secure", "unusual traffic",
+                "couldn't create your account", "browser atau aplikasi mungkin tidak aman",
+                "lalu lintas yang tidak biasa", "tidak dapat membuat akun", "this page isn't available"):
         if pat in body:
-            raise RuntimeError(
-                f"Google memblokir sesi ini (Risk Engine / WAF).\nIndikasi: '{pat}'.\n"
-                "Saran: Gunakan koneksi seluler/residential proxy atau jeda beberapa saat."
-            )
+            return pat
+    return None
 
+def generate_random_profile():
+    fn = random.choice(NAMA_DEPAN)
+    ln = random.choice(NAMA_BELAKANG)
+    rnum = random.randint(100, 9999)
+    username = f"{fn.lower()}{ln.lower()}{rnum}"
+    chars = string.ascii_letters + string.digits + "!@#$"
+    pwd = "".join(random.choice(chars) for _ in range(12)) + "A1!"
+    day = str(random.randint(1, 28))
+    month = str(random.randint(1, 12))
+    year = str(random.randint(1993, 2003))
+    return {
+        "first": fn,
+        "last": ln,
+        "username": username,
+        "password": pwd,
+        "day": day,
+        "month": month,
+        "year": year,
+        "gender": "rather_not_say"
+    }
 
-def update_progress(session: SignupSession, step: int, total: int, title: str, details: str = ""):
-    txt = (
-        f"🤖 *PROGRES PENDAFTARAN GMAIL*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 *Langkah [{step}/{total}]*: {title}\n"
-    )
-    if details:
-        txt += f"ℹ️ _{details}_\n"
-    txt += (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Target: `{session.data['username']}@gmail.com`\n"
-        f"📱 No HP : `{session.data['phone']}`\n"
-        f"⏳ Status : Sedang diproses oleh browser..."
-    )
-    if session.status_msg_id:
-        edit_message(session.chat_id, session.status_msg_id, txt)
-    else:
-        res = send_message(session.chat_id, txt)
-        if res.get("ok"):
-            session.status_msg_id = res["result"]["message_id"]
+# ── WORKER AUTOMATION ──────────────────────────────────────────────────
 
+def run_signup_worker(chat_id, status_mid, form_data):
+    global SESSION
+    SESSION["cancel_requested"] = False
+    SESSION["otp_code"] = None
+    SESSION["otp_event"].clear()
 
-def run_signup_worker(session: SignupSession):
-    global CURRENT_SESSION
-    from patchright.sync_api import sync_playwright
+    def update_status(txt, kb=None):
+        send(chat_id, txt, kb=kb, edit_mid=status_mid)
 
-    chat_id = session.chat_id
-    data = session.data
-    total_steps = 7
+    os.environ["DISPLAY"] = ":99"
+    ensure_xvfb()
 
+    first = form_data["first"]
+    last = form_data["last"]
+    username = form_data["username"]
+    password = form_data["password"]
+    phone = form_data["phone"]
+    day = form_data["day"]
+    month = form_data["month"]
+    year = form_data["year"]
+    gender = form_data.get("gender", "rather_not_say")
+    proxy = form_data.get("proxy")
+
+    browser = None
+    page = None
     try:
-        update_progress(session, 1, total_steps, "Inisialisasi Browser Anti-Deteksi", "Memuat Patchright Chromium Engine...")
-        
         with sync_playwright() as p:
-            # Gunakan mode visual virtual jika ada DISPLAY
-            is_headless = "DISPLAY" not in os.environ
-            session.browser = p.chromium.launch(
-                headless=is_headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage"
-                ]
-            )
-            
-            ctx_kw = {
-                "locale": "en-US",
-                "viewport": {"width": 1366, "height": 900},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            }
-            if session.proxy:
-                ctx_kw["proxy"] = {"server": session.proxy}
-                
-            session.context = session.browser.new_context(**ctx_kw)
-            page = session.context.new_page()
-            session.page = page
+            update_status("⏳ *[1/8] Menyiapkan browser Patchright di :99...*")
+            browser_args = ["--disable-blink-features=AutomationControlled"]
+            browser = p.chromium.launch(headless=False, args=browser_args)
+            SESSION["browser"] = browser
 
-            if session.is_cancelled:
-                return
+            ctx_kw = {"locale": "en-US", "viewport": {"width": 1366, "height": 900}}
+            if proxy:
+                ctx_kw["proxy"] = {"server": proxy}
+            ctx = browser.new_context(**ctx_kw)
+            page = ctx.new_page()
 
-            # [1/7] Buka Halaman
-            update_progress(session, 1, total_steps, "Membuka Halaman Registrasi Google", "Menghubungkan ke accounts.google.com...")
-            page.goto(
-                "https://accounts.google.com/signup/v2/webcreateaccount?flowName=GlifWebSignIn&flowEntry=SignUp&hl=en",
-                wait_until="domcontentloaded",
-                timeout=45000
-            )
-            time.sleep(2)
-            check_google_blocks(page)
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # Lewati recovery email jika muncul
+            update_status(f"🌐 *[1/8] Membuka Google Signup...*\nTarget: `{username}@gmail.com`")
+            page.goto("https://accounts.google.com/signup/v2/webcreateaccount?flowName=GlifWebSignIn&flowEntry=SignUp&hl=en",
+                      wait_until="domcontentloaded", timeout=45000)
+            sleep_r(2, 3)
+
+            blk = check_google_blocked(page)
+            if blk:
+                raise RuntimeError(f"Google Risk Engine mendeteksi: `{blk}`")
+
+            # Check recovery screen
             if page.locator("#recoveryEmailId").first.is_visible(timeout=2000):
                 click_any(page, texts=("Skip", "Lewati"))
-                time.sleep(1)
+                sleep_r(1, 2)
 
-            if session.is_cancelled:
-                return
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # [2/7] Isi Nama
-            update_progress(session, 2, total_steps, "Mengisi Identitas Diri", f"Nama: {data['first']} {data['last']}")
-            human_type(page, page.locator("#firstName").first, data["first"])
-            human_type(page, page.locator("#lastName").first, data["last"])
+            update_status(f"✍️ *[2/8] Mengisi nama: {first} {last}...*",
+                          kb=[[{"text": "❌ Batalkan", "callback_data": "btn_cancel"}]])
+            human_type(page, page.locator("#firstName").first, first)
+            human_type(page, page.locator("#lastName").first, last)
             click_any(page, selectors=("#accountDetailsNext",), texts=("Next", "Berikutnya"))
 
-            # [3/7] Isi Tanggal Lahir & Gender
-            update_progress(session, 3, total_steps, "Mengisi Tanggal Lahir & Gender", f"TTL: {data['day']}/{data['month']}/{data['year']}")
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
+
+            update_status("📅 *[3/8] Mengisi tanggal lahir & gender...*",
+                          kb=[[{"text": "❌ Batalkan", "callback_data": "btn_cancel"}]])
             page.wait_for_selector("#day, input#day", timeout=20000)
-            time.sleep(0.8)
+            sleep_r(0.8, 1.2)
             try:
-                page.locator("#month").first.select_option(index=int(data["month"]))
+                page.locator("#month").first.select_option(index=int(month))
             except Exception:
-                human_type(page, page.locator("#month").first, data["month"])
-            time.sleep(0.3)
-            human_type(page, page.locator("#day").first, data["day"])
-            human_type(page, page.locator("#year").first, data["year"])
-            
-            gval = {"male": "Male", "female": "Female"}.get(data["gender"].lower(), "Rather not say")
+                human_type(page, page.locator("#month").first, str(month))
+            sleep_r(0.3, 0.6)
+            human_type(page, page.locator("#day").first, str(day))
+            human_type(page, page.locator("#year").first, str(year))
+
+            gval = {"male": "Male", "female": "Female"}.get(gender.lower(), "Rather not say")
             try:
                 page.locator("#gender").first.select_option(label=gval)
             except Exception:
                 pass
-            time.sleep(0.4)
+            sleep_r(0.3, 0.6)
             click_any(page, selectors=("#genderSelectionNext", "#next"), texts=("Next", "Berikutnya"))
 
-            if session.is_cancelled:
-                return
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # [4/7] Tentukan Username
-            update_progress(session, 4, total_steps, "Menentukan Alamat Gmail", f"Username: {data['username']}@gmail.com")
-            time.sleep(1.5)
+            update_status(f"👤 *[4/8] Memilih username: {username}...*",
+                          kb=[[{"text": "❌ Batalkan", "callback_data": "btn_cancel"}]])
+            sleep_r(1.5, 2.0)
             click_any(page, texts=("Create your own Gmail address", "Buat alamat Gmail sendiri"))
-            time.sleep(0.6)
-            
+            sleep_r(0.6, 1.0)
             if page.locator("#username").first.is_visible(timeout=4000):
-                human_type(page, page.locator("#username").first, data["username"])
+                human_type(page, page.locator("#username").first, username)
                 click_any(page, selectors=("#next",), texts=("Next", "Berikutnya"))
-                time.sleep(1.5)
-                # Cek jika username sudah dipakai
+                sleep_r(1.5, 2.0)
                 if page.locator("#username").first.is_visible(timeout=2500):
-                    err = page.inner_text("body")[:400].lower()
-                    if "taken" in err or "sudah dipakai" in err:
-                        raise RuntimeError(f"Username '{data['username']}' sudah dipakai orang lain. Coba username lain.")
+                    err = page.inner_text("body")[:400]
+                    if "taken" in err.lower() or "sudah dipakai" in err.lower():
+                        raise RuntimeError(f"Username `{username}` sudah dipakai orang lain.")
             else:
                 fallback = first_visible(page, ["#username", "input[type=email]"], timeout=4000)
                 if fallback:
-                    human_type(page, fallback, data["username"])
+                    human_type(page, fallback, username)
                     click_any(page, selectors=("#next",), texts=("Next", "Berikutnya"))
 
-            if session.is_cancelled:
-                return
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # [5/7] Isi Password
-            update_progress(session, 5, total_steps, "Mengamankan Kata Sandi", "Mengisi password...")
+            update_status("🔒 *[5/8] Mengisi password...*",
+                          kb=[[{"text": "❌ Batalkan", "callback_data": "btn_cancel"}]])
             page.wait_for_selector("#passwd", timeout=20000)
-            human_type(page, page.locator("#passwd").first, data["password"])
-            human_type(page, page.locator("#confirmPasswd").first, data["password"])
+            human_type(page, page.locator("#passwd").first, password)
+            human_type(page, page.locator("#confirmPasswd").first, password)
             click_any(page, selectors=("#create-password-next",), texts=("Next", "Berikutnya"))
-            time.sleep(2)
-            check_google_blocks(page)
 
-            if session.is_cancelled:
-                return
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # [6/7] Verifikasi Nomor HP & Tunggu OTP
-            update_progress(session, 6, total_steps, "Verifikasi Nomor Telepon", f"Kirim SMS ke: {data['phone']}")
+            update_status("📱 *[6/8] Memeriksa verifikasi nomor HP...*")
             if page.locator("#phoneNumberId").first.is_visible(timeout=15000):
-                human_type(page, page.locator("#phoneNumberId").first, data["phone"])
-                click_any(
-                    page,
-                    selectors=("#sendVerifyCodeButton", "#next"),
-                    texts=("Get a verification code", "Dapatkan kode verifikasi", "Verify", "Verifikasi", "Next", "Berikutnya")
-                )
-                time.sleep(2.5)
-                check_google_blocks(page)
+                human_type(page, page.locator("#phoneNumberId").first, phone)
+                click_any(page, selectors=("#sendVerifyCodeButton", "#next"),
+                          texts=("Get a verification code", "Dapatkan kode verifikasi", "Verify", "Verifikasi", "Next", "Berikutnya"))
+                sleep_r(2, 3)
+
+                blk = check_google_blocked(page)
+                if blk:
+                    raise RuntimeError(f"Google Risk Engine memblokir nomor: `{blk}`")
 
                 otp_el = first_visible(page, ["#code", "input[type=tel]"], timeout=20000)
-                if not otp_el:
-                    page.screenshot(path=str(SCREENSHOT_PATH))
-                    raise RuntimeError("Kolom isian OTP tidak muncul pada formulir Google.")
+                if otp_el is None:
+                    page.screenshot(path=SCREENSHOT_FILE)
+                    raise RuntimeError("Field OTP tidak muncul. Cek screenshot.")
 
-                # Minta OTP ke Telegram
-                otp_prompt = (
-                    "📲 *KODE OTP GOOGLE DIBUTUHKAN!*\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"SMS verifikasi telah dikirim ke: `{data['phone']}`\n\n"
-                    "👉 *Ketik dan balas chat ini langsung dengan 6 digit kode OTP!*\n"
-                    "Contoh: `654321`\n\n"
-                    "⏱️ _Waktu tunggu: 2 menit sebelum sesi kedaluwarsa._"
+                # MINTA OTP KE TELEGRAM CHAT
+                SESSION["state"] = "WAITING_OTP"
+                SESSION["otp_event"].clear()
+                update_status(
+                    f"📩 *KODE OTP DIBUTUHKAN!*\n\n"
+                    f"Google sudah mengirim SMS kode verifikasi ke `{phone}`.\n\n"
+                    f"👉 *Ketik 6 digit kode OTP langsung di chat ini* (contoh: `123456`):\n"
+                    f"*(Waktu tunggu 180 detik)*",
+                    kb=[[{"text": "❌ Batalkan", "callback_data": "btn_cancel"}]]
                 )
-                send_message(chat_id, otp_prompt)
 
-                # Tunggu sinyal OTP dari handler Telegram
-                got_otp = session.otp_event.wait(timeout=120)
-                if not got_otp or not session.otp_code:
-                    raise TimeoutError("Waktu pengisian OTP habis (120 detik tanpa respons).")
+                signaled = SESSION["otp_event"].wait(timeout=180)
+                if SESSION["cancel_requested"]:
+                    raise Exception("Dibatalkan pengguna.")
+                if not signaled or not SESSION.get("otp_code"):
+                    raise RuntimeError("Waktu tunggu OTP habis (3 menit) atau tidak ada input.")
 
-                if session.is_cancelled:
-                    return
-
-                update_progress(session, 6, total_steps, "Memverifikasi Kode OTP", f"Memasukkan kode: {session.otp_code}...")
-                human_type(page, otp_el, session.otp_code)
+                otp = SESSION["otp_code"]
+                update_status(f"⏳ *[6/8] Memasukkan kode OTP: `{otp}`...*")
+                human_type(page, otp_el, otp)
                 click_any(page, selectors=("#verifyCodeButton",), texts=("Verify", "Verifikasi", "Next", "Berikutnya"))
-                time.sleep(3)
-                check_google_blocks(page)
+                sleep_r(2.5, 3.5)
             else:
-                update_progress(session, 6, total_steps, "Verifikasi Nomor Telepon", "Google tidak meminta verifikasi nomor (Lolos Cepat).")
+                update_status("⏩ Google tidak meminta verifikasi nomor HP.")
 
-            if session.is_cancelled:
-                return
+            if SESSION["cancel_requested"]:
+                raise Exception("Dibatalkan pengguna.")
 
-            # [7/7] Persetujuan Syarat & Privasi
-            update_progress(session, 7, total_steps, "Menyetujui Ketentuan Layanan", "Menyelesaikan pendaftaran akun...")
-            time.sleep(2)
+            update_status("📜 *[7/8] Menyetujui Persyaratan Layanan (ToS)...*")
+            sleep_r(1.5, 2.0)
             click_any(page, texts=("Yes, I'm in", "Ya, saya ikut"))
-            time.sleep(1.5)
+            sleep_r(1.5, 2.0)
             click_any(page, texts=("Skip", "Lewati"))
-            time.sleep(1.5)
+            sleep_r(1.5, 2.0)
             click_any(page, selectors=("#termAgree",), texts=("I agree", "Saya setuju"))
-            time.sleep(4)
-            check_google_blocks(page)
+            sleep_r(3, 4)
 
-            # Cek Hasil Akhir
+            blk = check_google_blocked(page)
+            if blk:
+                raise RuntimeError(f"Google Risk Engine memblokir ToS: `{blk}`")
+
+            update_status("🔍 *[8/8] Memverifikasi akun...*")
             url = page.url
-            body = page.inner_text("body")[:800]
-            page.screenshot(path=str(SCREENSHOT_PATH))
+            try:
+                body = page.inner_text("body")[:600]
+            except Exception:
+                body = ""
 
-            is_success = ("myaccount.google.com" in url) or ("Welcome" in body) or ("Selamat datang" in body)
-            full_email = f"{data['username']}@gmail.com"
+            ok = ("myaccount.google.com" in url) or ("Welcome" in body) or ("Selamat datang" in body)
+            page.screenshot(path=SCREENSHOT_FILE)
 
-            if is_success:
-                save_account_result(full_email, data["password"], data["phone"])
-                success_card = (
-                    "🎉 *AKUN GMAIL BERHASIL DIBUAT!*\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📧 *Email*    : `{full_email}`\n"
-                    f"🔑 *Password* : `{data['password']}`\n"
-                    f"📱 *No. HP*   : `{data['phone']}`\n"
-                    f"📅 *TTL*      : `{data['day']}-{data['month']}-{data['year']}`\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💾 _Tersimpan permanen di akun_gmail.txt_"
+            email = f"{username}@gmail.com"
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if ok:
+                with open(OUT_FILE, "a") as f:
+                    f.write(f"{email}|{password}|{phone}|{ts}\n")
+                msg = (
+                    f"🎉 *PENDAFTARAN GMAIL SUKSES!*\n"
+                    f"──────────────────────\n"
+                    f"📧 *Email:* `{email}`\n"
+                    f"🔑 *Password:* `{password}`\n"
+                    f"📱 *Nomor HP:* `{phone}`\n"
+                    f"📅 *Waktu:* `{ts}`\n"
+                    f"──────────────────────\n"
+                    f"💾 *Tersimpan di:* `akun_gmail.txt`"
                 )
-                send_message(chat_id, success_card, reply_markup=main_keyboard())
-                send_photo(chat_id, SCREENSHOT_PATH, caption=f"Bukti akun aktif: {full_email}")
+                update_status(msg, kb=kb_main())
+                send_photo(chat_id, SCREENSHOT_FILE, caption=f"✅ Bukti signup berhasil: `{email}`")
             else:
-                save_account_result(f"{full_email} (cek manual)", data["password"], data["phone"])
-                warn_msg = (
-                    "⚠️ *STATUS BELUM DAPAT DIPASTIKAN*\n"
-                    f"URL Terakhir: `{url}`\n"
-                    "Tangkapan layar browser dikirimkan di bawah untuk verifikasi visual."
+                with open(OUT_FILE, "a") as f:
+                    f.write(f"{email} (cek_manual)|{password}|{phone}|{ts}\n")
+                msg = (
+                    f"⚠️ *Status Akun Belum Terkonfirmasi*\n"
+                    f"──────────────────────\n"
+                    f"📧 Target: `{email}`\n"
+                    f"🌐 URL Akhir: `{url}`\n"
+                    f"Cek screenshot untuk detail layar terakhir Google."
                 )
-                send_message(chat_id, warn_msg, reply_markup=main_keyboard())
-                send_photo(chat_id, SCREENSHOT_PATH, caption="Tangkapan layar status pendaftaran")
+                update_status(msg, kb=kb_main())
+                send_photo(chat_id, SCREENSHOT_FILE, caption=f"📸 Layar Google: `{email}`")
 
     except Exception as e:
         err_msg = str(e)
-        fail_card = (
-            "❌ *PENDAFTARAN GAGAL*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ *Kendala*: {err_msg}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Silakan coba kembali atau ganti nomor HP / proxy."
-        )
-        send_message(chat_id, fail_card, reply_markup=main_keyboard())
-        if session.page:
+        try:
+            if page:
+                page.screenshot(path=SCREENSHOT_FILE)
+        except Exception:
+            pass
+        send(chat_id,
+             f"❌ *Pendaftaran Gagal*\n\n"
+             f"Error: `{err_msg}`\n\n"
+             f"💡 *Catatan:* Jika terblokir Risk Engine Google, gunakan Residential Proxy via parameter proxy atau coba jeda beberapa saat.",
+             kb=kb_main(), edit_mid=status_mid)
+        if os.path.exists(SCREENSHOT_FILE):
+            send_photo(chat_id, SCREENSHOT_FILE, caption="📸 Tangkapan layar browser saat gagal")
+
+    finally:
+        SESSION["state"] = "IDLE"
+        SESSION["browser"] = None
+        SESSION["otp_code"] = None
+        if browser:
             try:
-                session.page.screenshot(path=str(SCREENSHOT_PATH))
-                send_photo(chat_id, SCREENSHOT_PATH, caption=f"Kondisi browser saat gagal: {err_msg[:100]}")
+                browser.close()
             except Exception:
                 pass
-    finally:
-        with SESSION_LOCK:
-            if session.browser:
-                try:
-                    session.browser.close()
-                except Exception:
-                    pass
-            CURRENT_SESSION = None
 
+# ── TELEGRAM HANDLERS ──────────────────────────────────────────────────
 
-# ── Telegram Message Handler ─────────────────────────────────────────
+def handle_callback(cb):
+    chat = cb["message"]["chat"]["id"]
+    mid = cb["message"]["message_id"]
+    uid = cb["from"]["id"]
+    data = cb.get("data", "")
+    answer_cb(cb["id"])
 
-def handle_update(u: dict):
-    global CURRENT_SESSION
-
-    # 1. Callback Query (Tombol Inline)
-    if "callback_query" in u:
-        cb = u["callback_query"]
-        answer_callback(cb["id"])
-        chat_id = cb["message"]["chat"]["id"]
-        from_id = cb["from"]["id"]
-        data = cb.get("data", "")
-
-        if from_id != OWNER_ID:
-            send_message(chat_id, "⛔ *Akses Ditolak*. Bot ini bersifat privat untuk Owner.")
-            return
-
-        if data == "btn_auto":
-            USER_STATE[chat_id] = {"state": "AWAIT_AUTO_PHONE"}
-            msg = (
-                "⚡ *MODE DAFTAR CEPAT (AUTO GENERATE)*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Nama, username, password, dan TTL akan dibuat secara otomatis.\n\n"
-                "👉 *Masukkan nomor HP Anda* (wajib aktif untuk menerima SMS OTP):\n"
-                "Contoh: `+6281234567890`"
-            )
-            send_message(chat_id, msg)
-
-        elif data == "btn_manual":
-            USER_STATE[chat_id] = {"state": "AWAIT_MANUAL_NAME"}
-            msg = (
-                "📝 *MODE DAFTAR MANUAL*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "👉 *Masukkan Nama Depan dan Belakang* (dipisah spasi):\n"
-                "Contoh: `Budi Santoso`"
-            )
-            send_message(chat_id, msg)
-
-        elif data == "btn_list":
-            if not OUT_FILE.exists():
-                send_message(chat_id, "📋 Belum ada akun yang tersimpan di `akun_gmail.txt`.", reply_markup=main_keyboard())
-                return
-            lines = [l.strip() for l in OUT_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-            if not lines:
-                send_message(chat_id, "📋 Berkas `akun_gmail.txt` masih kosong.", reply_markup=main_keyboard())
-                return
-            
-            txt = f"📋 *DAFTAR AKUN TERSIMPAN ({len(lines)} Akun)*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            for i, item in enumerate(lines[-15:], 1):  # 15 akun terakhir
-                parts = item.split("|")
-                email = parts[0]
-                pw = parts[1] if len(parts) > 1 else "-"
-                phone = parts[2] if len(parts) > 2 else "-"
-                txt += f"{i}. `{email}` | `{pw}` | `{phone}`\n"
-            txt += "━━━━━━━━━━━━━━━━━━━━━━"
-            send_message(chat_id, txt, reply_markup=main_keyboard())
-
-        elif data == "btn_status":
-            disp = os.environ.get("DISPLAY", "None")
-            active = "Sedang Mendaftar ⏳" if CURRENT_SESSION else "Siap / Idle 🟢"
-            txt = (
-                "ℹ️ *STATUS SISTEM BOT GMAIL*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🤖 Status Engine : `{active}`\n"
-                f"🖥️ Virtual Display: `{disp}`\n"
-                f"🛠️ Driver        : `Patchright Chromium (Stealth)`\n"
-                f"👑 Owner ID      : `{OWNER_ID}`\n"
-                f"🕒 Server Time   : `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
-                "━━━━━━━━━━━━━━━━━━━━━━"
-            )
-            send_message(chat_id, txt, reply_markup=main_keyboard())
-
-        elif data == "btn_cancel":
-            with SESSION_LOCK:
-                if CURRENT_SESSION:
-                    CURRENT_SESSION.is_cancelled = True
-                    CURRENT_SESSION.otp_event.set()
-                    send_message(chat_id, "🛑 Sesi pendaftaran browser berhasil dibatalkan.")
-                else:
-                    send_message(chat_id, "ℹ️ Tidak ada sesi pendaftaran aktif yang sedang berjalan.")
-            USER_STATE.pop(chat_id, None)
+    if uid != OWNER:
         return
 
-    # 2. Pesan Teks
-    msg = u.get("message", {})
+    if data == "btn_wizard":
+        SESSION["form"] = {}
+        SESSION["state"] = "WIZ_NAME"
+        send(chat, "👤 *[Step 1/6: Nama]*\n\nKetik nama depan & belakang (contoh: `Budi Santoso`):",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]], edit_mid=mid)
+
+    elif data == "btn_quick_rnd":
+        prof = generate_random_profile()
+        SESSION["form"] = prof
+        SESSION["state"] = "QUICK_PHONE"
+        txt = (
+            "🎲 *PROFIL ACAK DIGENERATE!*\n"
+            "──────────────────────\n"
+            f"Nama: `{prof['first']} {prof['last']}`\n"
+            f"Target: `{prof['username']}@gmail.com`\n"
+            f"Password: `{prof['password']}`\n"
+            f"TTL: `{prof['day']}/{prof['month']}/{prof['year']}`\n"
+            "──────────────────────\n\n"
+            "👉 *Ketik Nomor HP lo sekarang* (format `+62812xxx` atau `0812xxx`):"
+        )
+        send(chat, txt, kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]], edit_mid=mid)
+
+    elif data == "btn_accounts":
+        if not os.path.exists(OUT_FILE):
+            send(chat, "Belum ada akun tersimpan di `akun_gmail.txt`.", kb=kb_main(), edit_mid=mid)
+            return
+        lines = [l.strip() for l in open(OUT_FILE) if l.strip()]
+        if not lines:
+            send(chat, "File `akun_gmail.txt` masih kosong.", kb=kb_main(), edit_mid=mid)
+            return
+        last_accounts = lines[-10:]
+        txt = f"📋 *DAFTAR AKUN GMAIL (Total: {len(lines)})*\n──────────────────────\n"
+        for idx, acc in enumerate(last_accounts, 1):
+            txt += f"{idx}. `{acc}`\n"
+        send(chat, txt, kb=kb_main(), edit_mid=mid)
+
+    elif data == "btn_display":
+        res = subprocess.run("DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && echo OK || echo FAIL",
+                             shell=True, capture_output=True, text=True)
+        st = "🟢 AKTIF" if "OK" in res.stdout else "🔴 NONAKTIF (Auto-start saat signup)"
+        send(chat, f"🖥️ *Status Virtual Display :99*\n\nStatus: {st}", kb=kb_main(), edit_mid=mid)
+
+    elif data == "btn_help":
+        txt = (
+            "📖 *PANDUAN GMAIL SIGNUP BOT*\n"
+            "──────────────────────\n"
+            "1. *Wizard (/daftar)*: Input detail satu per satu secara interaktif.\n"
+            "2. *Cepat Acak (/acak)*: Otomatis generate nama, target user & password kuat, cukup ketik nomor HP.\n"
+            "3. *Perintah Instan (/quick)*:\n"
+            "`/quick Budi | Santoso | budisantoso88 | Password123! | +6281234567890`\n\n"
+            "Saat Google kirim SMS OTP, bot otomatis minta kode 6 digit di chat ini."
+        )
+        send(chat, txt, kb=kb_main(), edit_mid=mid)
+
+    elif data.startswith("gen_"):
+        mapping = {"gen_male": "Male", "gen_female": "Female", "gen_none": "Rather not say"}
+        SESSION["form"]["gender"] = mapping.get(data, "Rather not say")
+        form = SESSION["form"]
+        SESSION["state"] = "CONFIRM"
+        txt = (
+            "📋 *KONFIRMASI PENDAFTARAN*\n"
+            "──────────────────────\n"
+            f"Nama: `{form['first']} {form['last']}`\n"
+            f"Email: `{form['username']}@gmail.com`\n"
+            f"Password: `{form['password']}`\n"
+            f"Nomor HP: `{form['phone']}`\n"
+            f"TTL: `{form['day']}/{form['month']}/{form['year']}`\n"
+            f"Gender: `{form['gender']}`\n"
+            "──────────────────────\n"
+            "Siap dijalankan di browser :99?"
+        )
+        send(chat, txt, kb=[
+            [{"text": "🚀 Gas Daftar Sekarang", "callback_data": "btn_start_run"}],
+            [{"text": "❌ Batal", "callback_data": "btn_cancel"}]
+        ], edit_mid=mid)
+
+    elif data == "btn_start_run":
+        SESSION["state"] = "RUNNING"
+        sm = send(chat, "🚀 *Memulai pendaftaran Gmail...*", edit_mid=mid)
+        status_mid = sm.get("result", {}).get("message_id", mid)
+        t = threading.Thread(target=run_signup_worker, args=(chat, status_mid, SESSION["form"]))
+        t.daemon = True
+        t.start()
+
+    elif data == "btn_cancel":
+        SESSION["cancel_requested"] = True
+        if SESSION["browser"]:
+            try:
+                SESSION["browser"].close()
+            except Exception:
+                pass
+        SESSION["otp_event"].set()
+        SESSION["state"] = "IDLE"
+        send(chat, "❌ *Operasi dibatalkan.*", kb=kb_main(), edit_mid=mid)
+
+def handle_message(msg):
+    global _last_offset
     if "text" not in msg:
         return
-
-    chat_id = msg["chat"]["id"]
-    from_id = msg.get("from", {}).get("id")
+    chat = msg["chat"]["id"]
+    uid = msg.get("from", {}).get("id")
     text = msg["text"].strip()
 
-    if from_id != OWNER_ID:
-        send_message(chat_id, "⛔ *Akses Ditolak*. Bot ini bersifat privat untuk Owner.")
+    if uid != OWNER:
+        send(chat, "Maaf, bot ini private. Khusus owner.")
         return
 
-    # Cek jika ada sesi pendaftaran yang sedang MENUNGGU OTP
-    with SESSION_LOCK:
-        if CURRENT_SESSION and CURRENT_SESSION.chat_id == chat_id:
-            # Jika user mengirimkan kode 6 angka
-            clean_otp = text.replace("-", "").strip()
-            if re.fullmatch(r"\d{6}", clean_otp):
-                CURRENT_SESSION.otp_code = clean_otp
-                CURRENT_SESSION.otp_event.set()
-                send_message(chat_id, f"📥 Menerima kode OTP: `{clean_otp}`. Memasukkan ke Google...")
-                return
+    state = SESSION.get("state", "IDLE")
 
-    # Perintah Utama
-    if text in ("/start", "/menu"):
-        USER_STATE.pop(chat_id, None)
-        welcome = (
-            "🤖 *Selamat Datang di Gmail Signup Bot (Patchright)*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Bot otomatisasi pembuatan akun Gmail menggunakan browser stealth Patchright.\n"
-            "Dukungan bypass deteksi Google, simulasi ketikan manusia, dan verifikasi SMS langsung via Telegram.\n\n"
-            "Silakan pilih menu aksi di bawah:"
-        )
-        send_message(chat_id, welcome, reply_markup=main_keyboard())
+    if text.startswith("/cancel"):
+        SESSION["cancel_requested"] = True
+        if SESSION["browser"]:
+            try:
+                SESSION["browser"].close()
+            except Exception:
+                pass
+        SESSION["otp_event"].set()
+        SESSION["state"] = "IDLE"
+        send(chat, "❌ *Pendaftaran dibatalkan.*", kb=kb_main())
         return
 
-    if text == "/batal":
-        with SESSION_LOCK:
-            if CURRENT_SESSION:
-                CURRENT_SESSION.is_cancelled = True
-                CURRENT_SESSION.otp_event.set()
-                send_message(chat_id, "🛑 Sesi pendaftaran aktif berhasil dibatalkan.", reply_markup=main_keyboard())
-            else:
-                send_message(chat_id, "ℹ️ Tidak ada sesi yang sedang berjalan.", reply_markup=main_keyboard())
-        USER_STATE.pop(chat_id, None)
-        return
-
-    if text.startswith("/auto"):
-        parts = text.split(maxsplit=1)
-        if len(parts) > 1 and re.search(r"\+?\d{8,15}", parts[1]):
-            phone = parts[1].strip()
-            start_auto_signup(chat_id, phone)
+    # Handle OTP input saat browser menunggu
+    if state == "WAITING_OTP":
+        m = re.search(r"\b\d{6}\b", text)
+        if m:
+            otp_val = m.group(0)
+            SESSION["otp_code"] = otp_val
+            SESSION["otp_event"].set()
+            send(chat, f"⏳ *Kode OTP `{otp_val}` diterima.* Meneruskan ke Google...")
         else:
-            USER_STATE[chat_id] = {"state": "AWAIT_AUTO_PHONE"}
-            send_message(chat_id, "👉 *Ketik nomor HP yang akan didaftarkan* (contoh: `+6281234567890`):")
+            send(chat, "⚠️ Masukkan tepat 6 angka OTP (contoh: `123456`) atau /cancel:")
         return
 
-    # State Machine Input User
-    state_data = USER_STATE.get(chat_id, {})
-    state = state_data.get("state")
+    if text.startswith("/start") or text.startswith("/menu"):
+        SESSION["state"] = "IDLE"
+        send(chat,
+             "🤖 *GMAIL SIGNUP BOT — CONTROL PANEL*\n"
+             "──────────────────────\n"
+             "Bot otomatisasi pembuatan akun Google via Patchright Chromium.\n\n"
+             "Pilih mode dari tombol menu di bawah:",
+             kb=kb_main())
+        return
 
-    if state == "AWAIT_AUTO_PHONE":
-        phone_match = re.search(r"(\+?\d{9,16})", text.replace(" ", "").replace("-", ""))
-        if not phone_match:
-            send_message(chat_id, "⚠️ Format nomor HP tidak valid. Harap gunakan format internasional (contoh: `+6281234567890`).")
+    if text.startswith("/daftar"):
+        SESSION["form"] = {}
+        SESSION["state"] = "WIZ_NAME"
+        send(chat, "👤 *[Step 1/6: Nama]*\n\nKetik nama depan & belakang (contoh: `Budi Santoso`):",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
+        return
+
+    if text.startswith("/acak"):
+        prof = generate_random_profile()
+        SESSION["form"] = prof
+        SESSION["state"] = "QUICK_PHONE"
+        txt = (
+            "🎲 *PROFIL ACAK DIGENERATE!*\n"
+            "──────────────────────\n"
+            f"Nama: `{prof['first']} {prof['last']}`\n"
+            f"Target: `{prof['username']}@gmail.com`\n"
+            f"Password: `{prof['password']}`\n"
+            f"TTL: `{prof['day']}/{prof['month']}/{prof['year']}`\n"
+            "──────────────────────\n\n"
+            "👉 *Ketik Nomor HP lo sekarang* (format `+62812xxx`):"
+        )
+        send(chat, txt, kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
+        return
+
+    if text.startswith("/quick"):
+        parts = [p.strip() for p in text.replace("/quick", "").split("|") if p.strip()]
+        if len(parts) < 5:
+            send(chat, "⚠️ Format salah.\nGunakan: `/quick First | Last | username | pass | +628xxx`")
             return
-        phone = phone_match.group(1)
-        if not phone.startswith("+"):
-            if phone.startswith("08"):
-                phone = "+628" + phone[2:]
-            elif phone.startswith("62"):
-                phone = "+" + phone
-        USER_STATE.pop(chat_id, None)
-        start_auto_signup(chat_id, phone)
-        return
-
-    # Mode Manual Wizard
-    if state == "AWAIT_MANUAL_NAME":
-        names = text.split(maxsplit=1)
-        first = names[0].capitalize()
-        last = names[1].capitalize() if len(names) > 1 else "Saputra"
-        USER_STATE[chat_id] = {
-            "state": "AWAIT_MANUAL_USER",
-            "first": first,
-            "last": last
+        first, last, uname, pwd, ph = parts[0], parts[1], parts[2], parts[3], parts[4]
+        if not ph.startswith("+"):
+            ph = "+62" + ph.lstrip("0")
+        SESSION["form"] = {
+            "first": first, "last": last,
+            "username": uname.replace("@gmail.com", ""),
+            "password": pwd, "phone": ph,
+            "day": "15", "month": "06", "year": "1998", "gender": "rather_not_say"
         }
-        send_message(chat_id, f"✅ Nama: *{first} {last}*\n\n👉 Sekarang masukkan *Username Gmail* yang diinginkan (tanpa @gmail.com):")
+        SESSION["state"] = "RUNNING"
+        sm = send(chat, "🚀 *Menjalankan pendaftaran via Quick Command...*")
+        status_mid = sm.get("result", {}).get("message_id")
+        t = threading.Thread(target=run_signup_worker, args=(chat, status_mid, SESSION["form"]))
+        t.daemon = True
+        t.start()
         return
 
-    if state == "AWAIT_MANUAL_USER":
-        u_name = text.replace("@gmail.com", "").strip().lower()
-        USER_STATE[chat_id]["username"] = u_name
-        USER_STATE[chat_id]["state"] = "AWAIT_MANUAL_PASS"
-        send_message(chat_id, f"✅ Username: `{u_name}@gmail.com`\n\n👉 Masukkan *Password* akun:")
-        return
+    # Wizard state transitions
+    if state == "WIZ_NAME":
+        parts = text.split()
+        first = parts[0]
+        last = " ".join(parts[1:]) if len(parts) > 1 else "Pratama"
+        SESSION["form"]["first"] = first
+        SESSION["form"]["last"] = last
+        SESSION["state"] = "WIZ_USER"
+        send(chat, f"✅ Nama: `{first} {last}`\n\n👤 *[Step 2/6: Username]*\nKetik username Gmail yang diinginkan (tanpa @gmail.com):",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
 
-    if state == "AWAIT_MANUAL_PASS":
-        pwd = text.strip()
-        if len(pwd) < 8:
-            send_message(chat_id, "⚠️ Password minimal 8 karakter demi keamanan Google.")
-            return
-        USER_STATE[chat_id]["password"] = pwd
-        USER_STATE[chat_id]["state"] = "AWAIT_MANUAL_PHONE"
-        send_message(chat_id, "✅ Password tersimpan.\n\n👉 Masukkan *Nomor HP* (+62...):")
-        return
+    elif state == "WIZ_USER":
+        uname = text.replace("@gmail.com", "").replace(" ", "").lower()
+        SESSION["form"]["username"] = uname
+        SESSION["state"] = "WIZ_PASS"
+        chars = string.ascii_letters + string.digits + "!@#$"
+        rnd_pass = "".join(random.choice(chars) for _ in range(12)) + "A1!"
+        send(chat, f"✅ Target: `{uname}@gmail.com`\n\n🔒 *[Step 3/6: Password]*\nKetik password (atau ketik `acak` untuk password otomatis `{rnd_pass}`):",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
 
-    if state == "AWAIT_MANUAL_PHONE":
-        phone = text.strip()
-        if not phone.startswith("+") and phone.startswith("08"):
-            phone = "+628" + phone[2:]
-        data = USER_STATE[chat_id]
-        data["phone"] = phone
-        data["day"] = "15"
-        data["month"] = "8"
-        data["year"] = "2000"
-        data["gender"] = "male"
-        USER_STATE.pop(chat_id, None)
-        launch_registration(chat_id, data)
-        return
+    elif state == "WIZ_PASS":
+        if text.lower() == "acak":
+            chars = string.ascii_letters + string.digits + "!@#$"
+            pwd = "".join(random.choice(chars) for _ in range(12)) + "A1!"
+        else:
+            pwd = text
+        SESSION["form"]["password"] = pwd
+        SESSION["state"] = "WIZ_PHONE"
+        send(chat, f"✅ Password diatur.\n\n📱 *[Step 4/6: Nomor HP]*\nKetik nomor HP verifikasi (+62812xxx atau 0812xxx):",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
 
-    # Fallback jika chat bebas
-    send_message(chat_id, "Perintah tidak dikenali. Ketik /menu untuk membuka daftar pilihan.", reply_markup=main_keyboard())
+    elif state == "WIZ_PHONE":
+        ph = text.replace(" ", "").replace("-", "")
+        if not ph.startswith("+"):
+            ph = "+62" + ph.lstrip("0")
+        SESSION["form"]["phone"] = ph
+        SESSION["state"] = "WIZ_DOB"
+        send(chat, f"✅ Nomor HP: `{ph}`\n\n📅 *[Step 5/6: Tanggal Lahir]*\nKetik format `DD/MM/YYYY` (contoh: `15/08/1998`) atau ketik `acak`:",
+             kb=[[{"text": "❌ Batal", "callback_data": "btn_cancel"}]])
 
+    elif state == "WIZ_DOB":
+        if text.lower() == "acak":
+            d, m, y = str(random.randint(1, 28)), str(random.randint(1, 12)), str(random.randint(1993, 2003))
+        else:
+            pts = text.split("/")
+            if len(pts) == 3:
+                d, m, y = pts[0].strip(), pts[1].strip(), pts[2].strip()
+            else:
+                d, m, y = "15", "06", "1998"
+        SESSION["form"]["day"] = d
+        SESSION["form"]["month"] = m
+        SESSION["form"]["year"] = y
+        SESSION["state"] = "WIZ_GENDER"
+        send(chat, f"✅ TTL: `{d}/{m}/{y}`\n\n🚻 *[Step 6/6: Pilih Gender]*", kb=kb_gender())
 
-def start_auto_signup(chat_id: int, phone: str):
-    data = generate_random_identity(phone)
-    preview = (
-        "⚡ *MEMULAI AUTO REGISTRASI GMAIL*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Nama*     : {data['first']} {data['last']}\n"
-        f"📧 *Username* : `{data['username']}@gmail.com`\n"
-        f"🔑 *Password* : `{data['password']}`\n"
-        f"📱 *No. HP*   : `{data['phone']}`\n"
-        f"📅 *TTL*      : `{data['day']}-{data['month']}-{data['year']}`\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🚀 _Meluncurkan browser Patchright..._"
-    )
-    send_message(chat_id, preview)
-    launch_registration(chat_id, data)
-
-
-def launch_registration(chat_id: int, account_data: dict, proxy: str | None = None):
-    global CURRENT_SESSION
-    with SESSION_LOCK:
-        if CURRENT_SESSION:
-            send_message(chat_id, "⚠️ Masih ada proses pendaftaran akun lain yang aktif. Selesaikan atau ketik /batal terlebih dahulu.")
-            return
-        CURRENT_SESSION = SignupSession(chat_id, account_data, proxy)
-    
-    t = threading.Thread(target=run_signup_worker, args=(CURRENT_SESSION,), daemon=True)
-    t.start()
-
-
-# ── Bot Main Runner ──────────────────────────────────────────────────
+    elif state == "QUICK_PHONE":
+        ph = text.replace(" ", "").replace("-", "")
+        if not ph.startswith("+"):
+            ph = "+62" + ph.lstrip("0")
+        SESSION["form"]["phone"] = ph
+        SESSION["state"] = "RUNNING"
+        sm = send(chat, f"🚀 *Menjalankan pendaftaran akun acak...*\nNo HP: `{ph}`")
+        status_mid = sm.get("result", {}).get("message_id")
+        t = threading.Thread(target=run_signup_worker, args=(chat, status_mid, SESSION["form"]))
+        t.daemon = True
+        t.start()
 
 def main():
-    print("=" * 60)
-    print(" ⚡ GMAIL SIGNUP TELEGRAM BOT (PATCHRIGHT ENGINE)")
-    print(f" 👑 Target Owner ID: {OWNER_ID}")
-    print("=" * 60)
-
-    # Validasi Koneksi Token
-    me = telegram_api("getMe")
-    if not me.get("ok"):
-        print(f"[-] Gagal terhubung ke Telegram API dengan token: {me.get('error')}")
-        sys.exit(1)
-
-    bot_user = me["result"]["username"]
-    print(f"[✓] Bot online dan siap menerima perintah: @{bot_user}")
-
-    last_offset = 0
+    global _last_offset
+    ensure_xvfb()
+    me = api("getMe")
+    uname = me.get("result", {}).get("username", "Unknown")
+    print(f"Bot Gmail Signup live: @{uname}", flush=True)
     while True:
         try:
-            updates = telegram_api("getUpdates", {"offset": last_offset, "timeout": 30}, timeout=40)
+            updates = api("getUpdates", {"offset": _last_offset, "timeout": 30}, timeout=40)
             for u in updates.get("result", []):
-                last_offset = u["update_id"] + 1
-                try:
-                    handle_update(u)
-                except Exception as e:
-                    print(f"[-] Error menangani update: {e}")
+                _last_offset = u["update_id"] + 1
+                if "callback_query" in u:
+                    handle_callback(u["callback_query"])
+                elif "message" in u:
+                    handle_message(u["message"])
         except Exception as e:
-            print(f"[!] Network polling error: {e}")
             time.sleep(3)
-
 
 if __name__ == "__main__":
     main()
