@@ -7,3 +7,6 @@ akun_gmail.txt
 .env
 .venv/
 telegram_token.txt
+farmaoalah_token.txt
+*token*.txt
+manual_screens/
